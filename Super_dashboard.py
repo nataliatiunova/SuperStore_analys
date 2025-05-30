@@ -126,7 +126,6 @@ heatmap_data = data.copy()
 heatmap_data['Year_Month'] = pd.to_datetime(heatmap_data['Order Date']).dt.to_period('M').astype(str)
 category_month_sales = heatmap_data.groupby(['Category', 'Year_Month'])['Sales'].sum().reset_index()
 heatmap_pivot = category_month_sales.pivot(index='Category', columns='Year_Month', values='Sales')
-
 heatmap_data = data.copy()
 selected_heatmap_segment = st.selectbox("Select Segment for Heatmap", options=data['Segment'].unique(), index=0)
 heatmap_data = data[data['Segment'] == selected_heatmap_segment].copy()
@@ -146,16 +145,17 @@ fig_heatmap = px.imshow(
 fig_heatmap.update_layout(title='Sales Heatmap: Category vs Month', xaxis_nticks=20)
 st.plotly_chart(fig_heatmap, use_container_width=True)
 
-#  Hypotheses and Validation
+#  HYPOTHESIS and VALIDATION
 
-# HYPOTHESIS: 1 Repeat customers VS one time customers
+# 1 Repeat customers VS one time customers
 
 oreders_per_customer = data.groupby('Customer ID')['Order ID'].nunique().reset_index()
 oreders_per_customer.columns = ['Customer ID', 'Order Count']
 data_with_orders = data.merge(oreders_per_customer, on='Customer ID')
-data_with_orders['Is Repeat'] = data_with_orders['Order Count'] > 1
+data_with_orders['Is Repeat'] = data_with_orders['Order Count'] > 2
 avg_sales_by_group = data_with_orders.groupby('Is Repeat')['Sales'].mean().reset_index()
 avg_sales_by_group['Group'] = avg_sales_by_group['Is Repeat'].map({True: 'Repeat', False: 'One-time'})
+
 fig6 = px.bar(avg_sales_by_group, x='Group', y='Sales', text='Sales',
               title='Avg Sale: Repeat vs One-time Customers',
               color='Group', color_discrete_sequence=px.colors.qualitative.Set2)
@@ -164,23 +164,34 @@ fig6.update_layout(showlegend=False)
 st.plotly_chart(fig6, use_container_width=True)
 
 # HYPOTHESIS 2: Forecast Monthly Sales (XGBoost Forecasting with Features)
+# copy data
 monthly_sales = data.copy()
-monthly_sales['Year_Month'] = pd.to_datetime(monthly_sales['Order Date']).dt.to_period('M').astype(str)
+
+# transformation to year-month format
+monthly_sales['Year_Month'] = pd.to_datetime(monthly_sales['Order Date'], dayfirst=True).dt.to_period('M')
 monthly_sales = monthly_sales.groupby('Year_Month')['Sales'].sum().reset_index()
-monthly_sales['Year_Month'] = pd.to_datetime(monthly_sales['Year_Month'])
+
+# transform back to datetime for visualisation
+monthly_sales['Year_Month'] = monthly_sales['Year_Month'].dt.to_timestamp()
 monthly_sales = monthly_sales.sort_values('Year_Month')
 
-# Feature engineering
+# median for monthly sales
+monthly_median = monthly_sales['Sales'].median()
+st.markdown(f"**Median monthly sales:** ${monthly_median:,.2f}")
+
+# add parameters
 monthly_sales['Month'] = monthly_sales['Year_Month'].dt.month
 monthly_sales['Year'] = monthly_sales['Year_Month'].dt.year
 monthly_sales['Month_Num'] = np.arange(len(monthly_sales))
 
-# Train/test split
+# Devide date for test and train
 train = monthly_sales.iloc[:-3]
 test = monthly_sales.iloc[-3:]
 
+# XGBoost model realisation
 from sklearn.model_selection import GridSearchCV
 from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error
 
 X_train = train[['Month', 'Year', 'Month_Num']]
 y_train = train['Sales']
@@ -195,21 +206,59 @@ param_grid = {
 base_model = XGBRegressor(objective='reg:squarederror', random_state=42)
 grid_search = GridSearchCV(estimator=base_model, param_grid=param_grid, cv=3, scoring='neg_mean_absolute_error')
 grid_search.fit(X_train, y_train)
+
 best_model = grid_search.best_estimator_
 future_preds = best_model.predict(X_test)
+
 best_params = grid_search.best_params_
-st.markdown(f"**Best XGBoost Parameters:** {best_params}")
+best_mae = -grid_search.best_score_
+
+# parameter outputs and MAE
+st.markdown(f"**Best Cross-validated MAE:** {best_mae:,.2f}")
+st.markdown(f"**Best XGBoost parameters:** {best_params}")
+
+# DataFrame with forecast for last 3 months
 future_df = test.copy()
 future_df['Sales'] = future_preds
 
+# full series
 full_series = pd.concat([train[['Year_Month', 'Sales']], future_df[['Year_Month', 'Sales']]])
 
-fig7 = px.line(full_series, x='Year_Month', y='Sales',
-               title='XGBoost Forecast: Monthly Sales (3 months)', markers=True)
-fig7.add_scatter(x=future_df['Year_Month'], y=future_df['Sales'],
-                 mode='markers+lines', name='Forecast',
-                 line=dict(dash='dash'))
+# Dynamic forecast for N next months 
+st.subheader("Forecast sales for N months ahead")
+forecast_months = st.slider("Select Forecast Horizon", 1, 6, 3)
+
+# future months generator
+last_month_num = monthly_sales['Month_Num'].max()
+future_month_nums = np.arange(last_month_num + 1, last_month_num + 1 + forecast_months)
+
+future_months_df = pd.DataFrame({
+    'Month_Num': future_month_nums,
+    'Month': [(m % 12) + 1 for m in future_month_nums],
+    'Year': [monthly_sales['Year'].iloc[-1] + ((m + 1) // 12) for m in range(forecast_months)]
+})
+
+# Forecast
+future_preds_dynamic = best_model.predict(future_months_df[['Month', 'Year', 'Month_Num']])
+future_dynamic_dates = pd.date_range(start=monthly_sales['Year_Month'].max() + pd.DateOffset(months=1),
+                                     periods=forecast_months, freq='MS')
+
+future_dynamic_df = pd.DataFrame({
+    'Year_Month': future_dynamic_dates,
+    'Sales': future_preds_dynamic
+})
+
+# concatenation both dataframes 
+full_forecast = pd.concat([monthly_sales[['Year_Month', 'Sales']], future_dynamic_df])
+
+# forecast visualisation
+fig7 = px.line(full_forecast, x='Year_Month', y='Sales',
+              title=f'🔮 XGBoost Forecast for next {forecast_months} months', markers=True)
+fig7.add_scatter(x=future_dynamic_df['Year_Month'], y=future_dynamic_df['Sales'],
+                mode='markers+lines', name='Прогноз',
+                line=dict(dash='dash'))
 st.plotly_chart(fig7, use_container_width=True)
+
 
 # HYPOTHESIS 3: Pareto in Furniture category
 furniture_data = data[data['Category'] == 'Furniture']
@@ -227,7 +276,7 @@ fig8.add_shape(type='line', x0=0, y0=80, x1=100, y1=80,
 fig8.update_layout(xaxis_title='% of Customers', yaxis_title='% of Cumulative Sales')
 st.plotly_chart(fig8, use_container_width=True)
 
-# IMPLEMENTATION 1: Prioritized Clients Table
+# IMPLEMENTATION 2: Prioritized Clients Table
 st.subheader("Priority Clients (Top Revenue Generators)")
 priority_clients = (
     data.groupby(['Customer ID'])['Sales']
@@ -241,30 +290,6 @@ st.dataframe(priority_clients, use_container_width=True)
 import io
 csv = priority_clients.to_csv(index=False).encode('utf-8')
 st.download_button("Download CSV", data=csv, file_name='priority_clients.csv', mime='text/csv')
-
-# IMPLEMENTATION 2: Forecast Horizon Selector
-st.subheader("Forecast Sales for N Months Ahead")
-forecast_months = st.slider("Select Forecast Horizon", 1, 3, 6)
-
-# (Reusing previous forecast model)
-future_months_df = pd.DataFrame({
-    'Month_Num': np.arange(len(X_train) + len(X_test), len(X_train) + len(X_test) + forecast_months),
-    'Month': [(m % 12) + 1 for m in range(len(X_train) + len(X_test), len(X_train) + len(X_test) + forecast_months)],
-    'Year': [monthly_sales['Year'].max() + (m // 12) for m in range(forecast_months)]
-})
-future_preds_dynamic = best_model.predict(future_months_df[['Month', 'Year', 'Month_Num']])
-future_dynamic_dates = pd.date_range(start=monthly_sales['Year_Month'].max() + pd.DateOffset(months=1), periods=forecast_months, freq='MS')
-future_dynamic_df = pd.DataFrame({
-    'Year_Month': future_dynamic_dates,
-    'Sales': future_preds_dynamic
-})
-
-full_forecast = pd.concat([monthly_sales[['Year_Month', 'Sales']], future_dynamic_df])
-fig9 = px.line(full_forecast, x='Year_Month', y='Sales', title=f'🔮 XGBoost Forecast: Next {forecast_months} Months', markers=True)
-fig9.add_scatter(x=future_dynamic_df['Year_Month'], y=future_dynamic_df['Sales'],
-                 mode='markers+lines', name='Forecast',
-                 line=dict(dash='dash'))
-st.plotly_chart(fig9, use_container_width=True)
 
 # IMPLEMENTATION 3: Export Summary Report
 from fpdf import FPDF
